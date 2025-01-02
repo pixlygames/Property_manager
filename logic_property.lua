@@ -1,464 +1,595 @@
-DoorResource = GetResourceState('ox_doorlock') == 'started' and 'ox' or GetResourceState('qb-doorlock') == 'started' and 'qb'
-if not DoorResource then return error('Either ox or qb door system is started!!') end
+Property = {
+    property_id = nil,
+    propertyData = nil,
+    playersInside = nil,   -- src
+    playersInGarden = nil,   -- src
+    playersDoorbell = nil, -- src
 
+    raiding = false,
+}
+Property.__index = Property
 
-local dbloaded = false
-MySQL.ready(function()
-    MySQL.query('SELECT * FROM properties', {}, function(result)
-        if not result then
-            print("Error: No result returned from properties query.")
-            return
-        end
-        if result.id then -- If only one result
-            result = {result}
-        end
-        for _, v in pairs(result) do
-            local id = tostring(v.property_id)
-            local has_access = json.decode(v.has_access)
-            local owner = v.owner_citizenid
-            local propertyData = {
-                property_id = tostring(id),
-                owner = owner,
-                street = v.street,
-                region = v.region,
-                description = v.description,
-                has_access = has_access,
-                extra_imgs = json.decode(v.extra_imgs),
-                furnitures = json.decode(v.furnitures),
-                for_sale = v.for_sale,
-                price = v.price,
-                shell = v.shell,
-                apartment = v.apartment,
-                door_data = json.decode(v.door_data),
-                garage_data = json.decode(v.garage_data),
-                zone_data = v.zone_data,
-            }
-            PropertiesTable[id] = Property:new(propertyData)
+function Property:new(propertyData)
+    local self = setmetatable({}, Property)
 
-            if v.shell == 'mlo' and DoorResource == 'qb' and owner then
-                local property = PropertiesTable[id]
-                -- we add door access for qb doorlock
-                property:addMloDoorsAccess(owner)
-                if has_access and #has_access > 0 then
-                    for _, citizenId in ipairs(has_access) do
-                        property:addMloDoorsAccess(citizenId)
-                    end
-                end
-            end
-        end
+    self.property_id = tostring(propertyData.property_id)
+    self.propertyData = propertyData
 
-        dbloaded = true
-    end, function(err)
-        print("Error querying properties: " .. err)
-    end)
-end)
+    self.playersInside = {}
+    self.playersInGarden = {}
+    self.playersDoorbell = {}
 
-lib.callback.register("pmanager:server:requestProperties", function()
-    while not dbloaded do
-        Wait(100)
-    end
+    local stashName = ("property_%s"):format(propertyData.property_id)
+    local stashConfig = Config.Shells[propertyData.shell].stash
 
-    return PropertiesTable
-end)
-
-function RegisterProperty(propertyData, preventEnter, source)
-    propertyData.owner = propertyData.owner or nil
-    propertyData.has_access = propertyData.has_access or {}
-    propertyData.extra_imgs = propertyData.extra_imgs or {}
-    propertyData.furnitures = propertyData.furnitures or {}
-    propertyData.door_data = propertyData.door_data or {}
-    propertyData.garage_data = propertyData.garage_data or {}
-    propertyData.zone_data = propertyData.zone_data or {}
-    
-    local cols = "(owner_citizenid, street, region, description, has_access, extra_imgs, furnitures, for_sale, price, shell, apartment, door_data, garage_data, zone_data)"
-    local vals = "(@owner_citizenid, @street, @region, @description, @has_access, @extra_imgs, @furnitures, @for_sale, @price, @shell, @apartment, @door_data, @garage_data, @zone_data)"
-
-    local id = MySQL.insert.await("INSERT INTO properties " .. cols .. " VALUES " .. vals , {
-        ["@owner_citizenid"] = propertyData.owner or nil,
-        ["@street"] = propertyData.street,
-        ["@region"] = propertyData.region,
-        ["@description"] = propertyData.description,
-        ["@has_access"] = json.encode(propertyData.has_access),
-        ["@extra_imgs"] = json.encode(propertyData.extra_imgs),
-        ["@furnitures"] = json.encode(propertyData.furnitures),
-        ["@for_sale"] = propertyData.for_sale ~= nil and propertyData.for_sale or 1,
-        ["@price"] = propertyData.price or 0,
-        ["@shell"] = propertyData.shell or '',
-        ["@apartment"] = propertyData.apartment,
-        ["@door_data"] = json.encode(propertyData.shell == 'mlo' and {count = #propertyData.door_data} or propertyData.door_data),
-        ["@garage_data"] = json.encode(propertyData.garage_data),
-        ["@zone_data"] = json.encode(propertyData.zone_data),
-    })
-
-    if source and propertyData.shell == 'mlo' then
-        if DoorResource == 'ox' then
-            TriggerClientEvent("pmanager:client:createOxDoors", source, {
-                id = id,
-                doors = propertyData.door_data
-            })
-        else
-            local qb_doorlock = exports['qb-doorlock']
-            for _, v in ipairs(propertyData.door_data) do
-                local isArray = v[1] and true
-                local success, err = pcall(function()
-                    qb_doorlock:saveNewDoor(source, {
-                        locked = true,
-                        model = isArray and {v[1].model, v[2].model} or v.model,
-                        heading = isArray and {v[1].heading, v[2].heading} or v.heading,
-                        coords = isArray and {v[1].coords, v[2].coords} or v.coords,
-                        distance = 2.5,
-                        doortype = 'door',
-                        id = ('ps_mloproperty%s_%s'):format(id, _)
-                    }, isArray)
-                end)
-                if not success then
-                    print("Error saving new door: " .. err)
-                end
-            end
-        end
-        propertyData.door_data = {count = #propertyData.door_data}
-        Wait(1000)
-    end
-
-    id = tostring(id)
-    propertyData.property_id = id
-    PropertiesTable[id] = Property:new(propertyData)
-
-    TriggerClientEvent("pmanager:client:addProperty", -1, propertyData)
-
-    if propertyData.apartment and not preventEnter then
-        local player = QBCore.Functions.GetPlayerByCitizenId(propertyData.owner)
-        if not player then
-            print("Error: Player not found for citizen ID " .. propertyData.owner)
-            return
-        end
-
-        local src = player.PlayerData.source
-        local property = Property.Get(id)
-        if not property then
-            print("Error: Property not found for ID " .. id)
-            return
-        end
-
-        property:PlayerEnter(src)
-
-        Wait(1000)
-
-        local query = "SELECT skin FROM playerskins WHERE citizenid = ?"
-        local result = MySQL.Sync.fetchAll(query, {propertyData.owner})
-
-        if result and result[1] then
-            Debug("Player: " .. propertyData.owner .. " skin already exists!")
-        else
-            TriggerClientEvent("qb-clothes:client:CreateFirstCharacter", src)
-            Debug("Player: " .. propertyData.owner .. " is creating a new character!")
-        end
-
-        Framework[Config.Notify].Notify(src, "Open radial menu for furniture menu and place down your stash and clothing locker.", "info")
-
-        -- This will create the stash for the apartment and migrate the items from the old apartment stash if applicable
-        if GetResourceState('qb-inventory') == 'started' then
-            TriggerEvent("pmanager:server:createApartmentStash", propertyData.owner, id)
-        else
-            print("Error: qb-inventory is not started")
+    for k, v in ipairs(propertyData.furnitures) do
+        if v.type == 'storage' then
+            Framework[Config.Inventory].RegisterInventory(k == 1 and stashName or stashName..v.id, 'Property: ' ..  (propertyData.street or propertyData.apartment or 'Unknown') .. ' #'.. propertyData.property_id or propertyData.apartment or stashName, stashConfig)
         end
     end
 
-    return id
+    return self
 end
 
-local function getMainDoor(propertyId, doorIndex, isShell)
-    -- ps_mloproperty is prefix, self.property_id is property unique id, 1 is main door index, cause mlo can have multiple doors
+function Property:PlayerEnter(src)
+    local _src = tostring(src)
+    local isMlo = self.propertyData.shell == 'mlo'
+    local isIpl = self.propertyData.apartment and Config.Apartments[self.propertyData.apartment].interior
 
-    if isShell then
-        local property = Property.Get(propertyId)
-        if not property then return end
-        return {
-            coords = property.propertyData.door_data
-        }
+    self.playersInside[_src] = true
+
+    if not isMlo then
+        TriggerClientEvent('qb-weathersync:client:DisableSync', src)
     end
-    
-    local id = ('ps_mloproperty%s_%s'):format(propertyId, doorIndex)
-    return DoorResource == 'ox' and exports.ox_doorlock:getDoorFromName(id) or DoorResource == 'qb' and exports['qb-doorlock']:getDoor(id)
-end
-exports('getMainDoor', getMainDoor)
-lib.callback.register("pmanager:cb:getMainMloDoor", function(_, propertyId, doorIndex)
-    return getMainDoor(propertyId, doorIndex)
-end)
+    print(src, self.property_id)
+    TriggerClientEvent('pmanager:client:enterProperty', src, self.property_id, isMlo, self.propertyData)
 
-exports('registerProperty', RegisterProperty) -- triggered by realtor job
-AddEventHandler("pmanager:server:registerProperty", RegisterProperty)
-
-lib.callback.register("pmanager:cb:GetOwnedApartment", function(source, cid)
-    Debug("pmanager:cb:GetOwnedApartment", source, cid)
-    local result
-    if cid ~= nil then
-        local success, err = pcall(function()
-            result = MySQL.query.await('SELECT * FROM properties WHERE owner_citizenid = ? AND apartment IS NOT NULL AND apartment <> ""', { cid })
-        end)
-        if not success then
-            print("Error querying database for owned apartment with cid: " .. cid .. " - " .. err)
-            return nil
-        end
-    else
-        local src = source
-        local Player = QBCore.Functions.GetPlayer(src)
-        if not Player then
-            print("Error: Player not found for source: " .. src)
-            return nil
-        end
-        local success, err = pcall(function()
-            result = MySQL.query.await('SELECT * FROM properties WHERE owner_citizenid = ? AND apartment IS NOT NULL AND apartment <> ""', { Player.PlayerData.citizenid })
-        end)
-        if not success then
-            print("Error querying database for owned apartment with citizenid: " .. Player.PlayerData.citizenid .. " - " .. err)
-            return nil
+    if next(self.playersDoorbell) then
+        TriggerClientEvent("pmanager:client:updateDoorbellPool", src, self.property_id, self.playersDoorbell)
+        if self.playersDoorbell[_src] then
+            self.playersDoorbell[_src] = nil
         end
     end
 
-    if result and result[1] then
-        return result[1]
-    else
-        print("No owned apartment found for the given criteria.")
-        return nil
-    end
-end)
-
-lib.callback.register("pmanager:cb:inventoryHasItems", function(source, name, isOx)
-    local success, result
-    if isOx then
-        local items = #exports.ox_inventory:GetInventoryItems(name)
-        return items and items > 0
-    end
-
-    local query = lib.checkDependency('qb-inventory', '2.0.0') and 'SELECT items FROM inventories WHERE identifier = ?' or 'SELECT items FROM stashitems WHERE stash = ?'
-    
-    success, result = pcall(function()
-        return MySQL.query.await(query, { name })
-    end)
-
-    if not success then
-        print("Error querying database for inventory items: " .. result)
-        return false
-    end
-
-    if not result or not result[1] then
-        print("No items found for inventory: " .. name)
-        return false
-    end
-
-    return result[1].items ~= '[]'
-end)
-
-AddEventHandler("pmanager:server:updateProperty", function(type, property_id, data)
-    local property = Property.Get(property_id)
-    if not property then return end
-
-    property[type](property, data)
-end)
-
-AddEventHandler("onResourceStart", function(resourceName) -- Used for when the resource is restarted while in game
-	if (GetCurrentResourceName() == resourceName) then
-        while not dbloaded do
-            Wait(100)
-        end
-        TriggerClientEvent('pmanager:client:initialiseProperties', -1, PropertiesTable)
-	end 
-end)
-
-RegisterNetEvent("pmanager:server:createNewApartment", function(aptLabel)
-    local src = source
     local citizenid = GetCitizenid(src)
-    if not Config.StartingApartment then return end
-    local PlayerData = GetPlayerData(src)
 
-    local apartment = Config.Apartments[aptLabel]
-    if not apartment then return end
+    if self:CheckForAccess(citizenid) then
+        local Player = QBCore.Functions.GetPlayer(src)
+        local insideMeta = Player.PlayerData.metadata["inside"]
 
-    local propertyData = {
-        owner = citizenid,
-        description = string.format("This is %s's apartment in %s", PlayerData.charinfo.firstname .. " " .. PlayerData.charinfo.lastname, apartment.label),
-        for_sale = 0,
-        shell = apartment.shell,
-        apartment = apartment.label,
+        insideMeta.property_id = self.property_id
+        Player.Functions.SetMetaData("inside", insideMeta)
+    end
+
+    if not isMlo or isIpl then
+        local bucket = tonumber(self.property_id) -- because the property_id is a string
+        QBCore.Functions.SetPlayerBucket(src, bucket)
+    end
+end
+
+function Property:PlayerLeave(src)
+    local _src = tostring(src)
+    self.playersInside[_src] = nil
+
+    TriggerClientEvent('qb-weathersync:client:EnableSync', src)
+
+    local citizenid = GetCitizenid(src)
+
+    if self:CheckForAccess(citizenid) then
+        local Player = QBCore.Functions.GetPlayer(src)
+        local insideMeta = Player.PlayerData.metadata["inside"]
+
+        insideMeta.property_id = nil
+        Player.Functions.SetMetaData("inside", insideMeta)
+    end
+
+    QBCore.Functions.SetPlayerBucket(src, 0)
+end
+
+function Property:CheckForAccess(citizenid)
+    if self.propertyData.owner == citizenid then return true end
+    return lib.table.contains(self.propertyData.has_access, citizenid)
+end
+
+function Property:AddToDoorbellPoolTemp(src)
+    local _src = tostring(src)
+
+    local name = GetCharName(src)
+
+    self.playersDoorbell[_src] = {
+        src = src,
+        name = name
     }
 
-    Debug("Creating new apartment for " .. GetPlayerName(src) .. " in " .. apartment.label)
+    for src, _ in pairs(self.playersInside) do
+        local targetSrc = tonumber(src)
 
-    Framework[Config.Logs].SendLog("Creating new apartment for " .. GetPlayerName(src) .. " in " .. apartment.label)
-
-    RegisterProperty(propertyData)
-end)
-
--- we show the character creator if they spawn without starting appartment and doesn't have skin set
-RegisterNetEvent("QBCore:Server:OnPlayerLoaded", function()
-    if Config.StartingApartment then return end
-
-    local src = source
-    local citizenid = GetCitizenid(src)
-    local query = "SELECT skin FROM playerskins WHERE citizenid = ?"
-    
-    local success, result = pcall(function()
-        return MySQL.Sync.fetchAll(query, {citizenid})
-    end)
-
-    if not success then
-        print("Error querying database for player skin: " .. result)
-        return
+        Framework[Config.Notify].Notify(targetSrc, "Someone is at the door.", "info")
+        TriggerClientEvent("pmanager:client:updateDoorbellPool", targetSrc, self.property_id, self.playersDoorbell)
     end
 
-    if result and result[1] then
-        Debug("Player: " .. citizenid .. " skin already exists!")
-    else
-        TriggerClientEvent("qb-clothes:client:CreateFirstCharacter", src)
-        Debug("Player: " .. citizenid .. " is creating a new character!")
-    end
-end)
+    Framework[Config.Notify].Notify(src, "You rang the doorbell. Just wait...", "info")
 
--- Creates apartment stash
--- If player has an existing apartment from qb-apartments, it will transfer the items over to the new apartment stash
-RegisterNetEvent("pmanager:server:createApartmentStash", function(citizenId, propertyId)
-    local stashId = string.format("property_%s", propertyId)
-
-    -- Check for existing apartment and corresponding stash
-    local query = lib.checkDependency('qb-inventory', '2.0.0') and 'SELECT items, identifier FROM inventories WHERE identifier' or 'SELECT items, stash FROM stashitems WHERE stash'
-    local success, result = pcall(function()
-        return MySQL.query.await(('%s IN (SELECT name FROM apartments WHERE citizenid = ?)'):format(query), { citizenId })
-    end)
-
-    if not success then
-        print("Error querying database for existing apartment stash: " .. result)
-        return
-    end
-
-    local items = {}
-    if result[1] ~= nil then
-        items = json.decode(result[1].items)
-
-        -- Delete the old apartment stash as it is no longer needed
-        local deleteSuccess, deleteResult = pcall(function()
-            MySQL.Async.execute('DELETE FROM stashitems WHERE stash = ?', { result[1].identifier or result[1].stash })
-        end)
-
-        if not deleteSuccess then
-            print("Error deleting old apartment stash: " .. deleteResult)
-            return
+    SetTimeout(10000, function()
+        if self.playersDoorbell[_src] then
+            self.playersDoorbell[_src] = nil
+            Framework[Config.Notify].Notify(src, "No one answered the door.", "error")
         end
-    end
 
-    -- This will create the stash for the apartment (without requiring player to have first opened and placed item in it)
-    local saveSuccess, saveResult = pcall(function()
-        TriggerEvent('qb-inventory:server:SaveStashItems', stashId, items)
+        for src, _ in pairs(self.playersInside) do
+            local targetSrc = tonumber(src)
+
+            TriggerClientEvent("pmanagerg:client:updateDoorbellPool", targetSrc, self.property_id, self.playersDoorbell)
+        end
     end)
+end
 
-    if not saveSuccess then
-        print("Error saving new apartment stash: " .. saveResult)
+function Property:RemoveFromDoorbellPool(src)
+    local _src = tostring(src)
+
+    if self.playersDoorbell[_src] then
+        self.playersDoorbell[_src] = nil
     end
-end)
 
-RegisterNetEvent('qb-apartments:returnBucket', function()
-    local src = source
-    QBCore.Functions.SetPlayerBucket(src, 0)
-end)
+    for src, _ in pairs(self.playersInside) do
+        local targetSrc = tonumber(src)
 
-AddEventHandler("pmanager:server:addTenantToApartment", function (data)
-    local apartment = data.apartment
-    local targetSrc = tonumber(data.targetSrc)
+        TriggerClientEvent("pmanager:client:updateDoorbellPool", targetSrc, self.property_id, self.playersDoorbell)
+    end
+end
+
+
+
+function Property:UpdateDescription(data)
+    local description = data.description
     local realtorSrc = data.realtorSrc
-    local targetCitizenid = GetCitizenid(targetSrc, realtorSrc)
 
-    -- id of current apartment so we can change it
-    local property_id = nil
+    if self.propertyData.description == description then return end
 
-    for _, v in pairs(PropertiesTable) do
-        local propertyData = v.propertyData
-        if propertyData.owner == targetCitizenid then
-            if propertyData.apartment == apartment then
-                Framework[Config.Notify].Notify(targetSrc, "You are already in this apartment", "error")
-                Framework[Config.Notify].Notify(targetSrc, "This person is already in this apartment", "error")
+    self.propertyData.description = description
 
-                return
-            elseif propertyData.apartment and #propertyData.apartment > 1 then
-                property_id = propertyData.property_id
-                break
-            end
+    MySQL.update("UPDATE properties SET description = @description WHERE property_id = @property_id", {
+        ["@description"] = description,
+        ["@property_id"] = self.property_id
+    })
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateDescription", self.property_id, description)
+
+    Framework[Config.Logs].SendLog("**Changed Description** of property with id: " .. self.property_id .. " by: " .. GetPlayerName(realtorSrc))
+
+    Debug("Changed Description of property with id: " .. self.property_id, "by: " .. GetPlayerName(realtorSrc))
+end
+
+function Property:UpdatePrice(data)
+    local price = data.price
+    local realtorSrc = data.realtorSrc
+
+    if self.propertyData.price == price then return end
+
+    self.propertyData.price = price
+
+    MySQL.update("UPDATE properties SET price = @price WHERE property_id = @property_id", {
+        ["@price"] = price,
+        ["@property_id"] = self.property_id
+    })
+
+    TriggerClientEvent(pmanager:client:updateProperty", -1, "UpdatePrice", self.property_id, price)
+
+    Framework[Config.Logs].SendLog("**Changed Price** of property with id: " .. self.property_id .. " by: " .. GetPlayerName(realtorSrc))
+
+    Debug("Changed Price of property with id: " .. self.property_id, "by: " .. GetPlayerName(realtorSrc))
+end
+
+function Property:UpdateForSale(data)
+    local forsale = data.forsale
+    local realtorSrc = data.realtorSrc
+
+    self.propertyData.for_sale = forsale
+
+    MySQL.update("UPDATE properties SET for_sale = @for_sale WHERE property_id = @property_id", {
+        ["@for_sale"] = forsale and 1 or 0,
+        ["@property_id"] = self.property_id
+    })
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateForSale", self.property_id, forsale)
+
+    Framework[Config.Logs].SendLog("**Changed For Sale** of property with id: " .. self.property_id .. " by: " .. GetPlayerName(realtorSrc))
+
+    Debug("Changed For Sale of property with id: " .. self.property_id, "by: " .. GetPlayerName(realtorSrc))
+end
+
+function Property:UpdateShell(data)
+    local shell = data.shell
+    local realtorSrc = data.realtorSrc
+
+    if self.propertyData.shell == shell then return end
+
+    self.propertyData.shell = shell
+
+    MySQL.update("UPDATE properties SET shell = @shell WHERE property_id = @property_id", {
+        ["@shell"] = shell,
+        ["@property_id"] = self.property_id
+    })
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateShell", self.property_id, shell)
+
+    Framework[Config.Logs].SendLog("**Changed Shell** of property with id: " .. self.property_id .. " by: " .. GetPlayerName(realtorSrc))
+
+    Debug("Changed Shell of property with id: " .. self.property_id, "by: " .. GetPlayerName(realtorSrc))
+end
+
+function Property:addMloDoorsAccess(citizenid)
+    if self.propertyData.shell ~= 'mlo' then return end
+
+    if DoorResource == 'ox' then
+        local ox_doorlock = exports.ox_doorlock
+        for i=1 , self.propertyData.door_data.count do
+            local door = ox_doorlock:getDoorFromName(('ps_mloproperty%s_%s'):format(self.property_id, i))
+            local data = door.characters or {}
+            table.insert(data, citizenid)
+            ox_doorlock:editDoor(door.id, {characters = data})
+        end
+    else
+        local qb_doorlock = exports['qb-doorlock']
+        for i=1 , self.propertyData.door_data.count do
+            local id = ('ps_mloproperty%s_%s'):format(self.property_id, i)
+            local door = qb_doorlock:getDoor(id)
+            local data = door.authorizedCitizenIDs or {}
+            data[citizenid] = true
+            qb_doorlock:updateDoor(id, {authorizedCitizenIDs = data})
         end
     end
+end
 
-    if property_id == nil then
-        local newApartment = Config.Apartments[apartment]
-        if not newApartment then return end
+function Property:removeMloDoorsAccess(citizenid)
+    if self.propertyData.shell ~= 'mlo' then return end
 
-        local citizenid = GetCitizenid(targetSrc, realtorSrc)
-        local targetToAdd = QBCore.Functions.GetPlayerByCitizenId(citizenid).PlayerData
-        local propertyData = {
-            owner = targetCitizenid,
-            description = string.format("This is %s's apartment in %s", targetToAdd.charinfo.firstname .. " " .. targetToAdd.charinfo.lastname, newApartment.label),
-            for_sale = 0,
-            shell = newApartment.shell,
-            apartment = newApartment.label,
-        }
+    if DoorResource == 'ox' then
+        local ox_doorlock = exports.ox_doorlock
+        for i = 1, self.propertyData.door_data.count do
+            local door = ox_doorlock:getDoorFromName(('ps_mloproperty%s_%s'):format(self.property_id, i))
+            local data = door.characters or {}
+            for index, id in ipairs(data) do
+                if id == citizenid then
+                    table.remove(data, index)
+                    break
+                end
+            end
+            ox_doorlock:editDoor(door.id, {characters = data})
+        end
+    else
+        local qb_doorlock = exports['qb-doorlock']
+        for i = 1, self.propertyData.door_data.count do
+            local id = ('ps_mloproperty%s_%s'):format(self.property_id, i)
+            local door = qb_doorlock:getDoor(id)
+            local data = door.authorizedCitizenIDs or {}
+            data[citizenid] = nil
+            qb_doorlock:updateDoor(id, {authorizedCitizenIDs = data})
+        end
+    end
+end
 
-        Debug("Creating new apartment for " .. GetPlayerName(targetSrc) .. " in " .. newApartment.label)
+function Property:UpdateOwner(data)
+    local targetSrc = data.targetSrc
+    local realtorSrc = data.realtorSrc
 
-        Framework[Config.Logs].SendLog("Creating new apartment for " .. GetPlayerName(targetSrc) .. " in " .. newApartment.label)
+    if not realtorSrc then Debug("No Realtor Src found") return end
+    if not targetSrc then Debug("No Target Src found") return end
 
-        Framework[Config.Notify].Notify(targetSrc, "Your apartment is now at "..apartment, "success")
-        Framework[Config.Notify].Notify(realtorSrc, "You have added ".. targetToAdd.charinfo.firstname .. " " .. targetToAdd.charinfo.lastname .. " to apartment "..apartment, "success")
+    local previousOwner = self.propertyData.owner
 
-        RegisterProperty(propertyData, true)
+    local targetPlayer  = QBCore.Functions.GetPlayer(tonumber(targetSrc))
+    if not targetPlayer then return end
 
+    local PlayerData = targetPlayer.PlayerData
+    local bank = PlayerData.money.bank
+    local citizenid = PlayerData.citizenid
+
+    self:addMloDoorsAccess(citizenid)
+    if self.propertyData.shell == 'mlo' and DoorResource == 'qb' then
+        Framework[Config.Notify].Notify(targetSrc, "Go far away and come back for the door to update and open/close.", "error")
+    end
+
+    if self.propertyData.owner == citizenid then
+        Framework[Config.Notify].Notify(targetSrc, "You already own this property", "error")
+        Framework[Config.Notify].Notify(realtorSrc, "Client already owns this property", "error")
         return
     end
 
+    self.propertyData.owner = citizenid
+
+    MySQL.update("UPDATE properties SET owner_citizenid = @owner_citizenid, for_sale = @for_sale WHERE property_id = @property_id", {
+        ["@owner_citizenid"] = citizenid,
+        ["@for_sale"] = 0,
+        ["@property_id"] = self.property_id
+    })
+
+    self.propertyData.furnitures = {} -- to be fetched on enter
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateOwner", self.property_id, citizenid)
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateForSale", self.property_id, 0)
+    
+    Framework[Config.Logs].SendLog("**House Bought** by: **"..PlayerData.charinfo.firstname.." "..PlayerData.charinfo.lastname.."** for $"..self.propertyData.price.." from **"..realtor.PlayerData.charinfo.firstname.." "..realtor.PlayerData.charinfo.lastname.."** !")
+
+    Framework[Config.Notify].Notify(targetSrc, "You have bought the property for $"..self.propertyData.price, "success")
+    Framework[Config.Notify].Notify(realtorSrc, "Client has bought the property for $"..self.propertyData.price, "success")
+end
+
+function Property:UpdateImgs(data)
+    local imgs = data.imgs
+    local realtorSrc = data.realtorSrc
+
+    self.propertyData.imgs = imgs
+
+    MySQL.update("UPDATE properties SET extra_imgs = @extra_imgs WHERE property_id = @property_id", {
+        ["@extra_imgs"] = json.encode(imgs),
+        ["@property_id"] = self.property_id
+    })
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateImgs", self.property_id, imgs)
+
+    Framework[Config.Logs].SendLog("**Changed Images** of property with id: " .. self.property_id .. " by: " .. GetPlayerName(realtorSrc))
+
+    Debug("Changed Imgs of property with id: " .. self.property_id, "by: " .. GetPlayerName(realtorSrc))
+end
+
+
+function Property:UpdateDoor(data)
+    local door = data.door
+
+    if not door then return end
+    local realtorSrc = data.realtorSrc
+
+    local newDoor = {
+        x = math.floor(door.x * 10000) / 10000,
+        y = math.floor(door.y * 10000) / 10000,
+        z = math.floor(door.z * 10000) / 10000,
+        h = math.floor(door.h * 10000) / 10000,
+        length = door.length or 1.5,
+        width = door.width or 2.2,
+        locked = door.locked or false,
+    }
+
+    self.propertyData.door_data = newDoor
+
+    self.propertyData.street = data.street
+    self.propertyData.region = data.region
+
+
+    MySQL.update("UPDATE properties SET door_data = @door, street = @street, region = @region WHERE property_id = @property_id", {
+        ["@door"] = json.encode(newDoor),
+        ["@property_id"] = self.property_id,
+        ["@street"] = data.street,
+        ["@region"] = data.region
+    })
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateDoor", self.property_id, newDoor, data.street, data.region)
+
+    Framework[Config.Logs].SendLog("**Changed Door** of property with id: " .. self.property_id .. " by: " .. GetPlayerName(realtorSrc))
+
+    Debug("Changed Door of property with id: " .. self.property_id, "by: " .. GetPlayerName(realtorSrc))
+end
+
+function Property:UpdateHas_access(data)
+    local has_access = data or {}
+
+    self.propertyData.has_access = has_access
+
+    MySQL.update("UPDATE properties SET has_access = @has_access WHERE property_id = @property_id", {
+        ["@has_access"] = json.encode(has_access), --Array of cids
+        ["@property_id"] = self.property_id
+    })
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateHas_access", self.property_id, has_access)
+
+    Debug("Changed Has Access of property with id: " .. self.property_id)
+end
+
+
+function Property:UpdateApartment(data)
+    local apartment = data.apartment
+    local realtorSrc = data.realtorSrc
+    local targetSrc = data.targetSrc
+
+    self.propertyData.apartment = apartment
+
+    MySQL.update("UPDATE properties SET apartment = @apartment WHERE property_id = @property_id", {
+        ["@apartment"] = apartment,
+        ["@property_id"] = self.property_id
+    })
+
+    Framework[Config.Notify].Notify(realtorSrc, "Changed Apartment of property with id: " .. self.property_id .." to ".. apartment, "success")
+
+    Framework[Config.Notify].Notify(targetSrc, "Changed Apartment to " .. apartment, "success")
+
+    Framework[Config.Logs].SendLog("**Changed Apartment** with id: " .. self.property_id .. " by: **" .. GetPlayerName(realtorSrc) .. "** for **" .. GetPlayerName(targetSrc) .."**")
+
+    TriggerClientEvent("pmanager:client:updateProperty", -1, "UpdateApartment", self.property_id, apartment)
+
+    Debug("Changed Apartment of property with id: " .. self.property_id, "by: " .. GetPlayerName(realtorSrc))
+end
+
+function Property:DeleteProperty(data)
+    local realtorSrc = data.realtorSrc
+    local propertyid = self.property_id
+    local realtorName = GetPlayerName(realtorSrc)
+
+    MySQL.Async.execute("DELETE FROM properties WHERE property_id = @property_id", {
+        ["@property_id"] = propertyid
+    }, function (rowsChanged)
+        if rowsChanged > 0 then
+            Debug("Deleted property with id: " .. propertyid, "by: " .. realtorName)
+        end
+    end)
+
+    TriggerClientEvent("pmanager:client:removeProperty", -1, propertyid)
+
+    Framework[Config.Notify].Notify(realtorSrc, "Property with id: " .. propertyid .." has been removed.", "info")
+
+    Framework[Config.Logs].SendLog("**Property Deleted** with id: " .. propertyid .. " by: " .. realtorName)
+
+    PropertiesTable[propertyid] = nil
+    self = nil
+
+    Debug("Deleted property with id: " .. propertyid, "by: " .. realtorName)
+end
+
+function Property.Get(property_id)
+    return PropertiesTable[tostring(property_id)]
+end
+
+RegisterNetEvent('pmanager:server:enterGarden', function (property_id)
+    local src = source
+    local property = Property.Get(property_id)
+
+    if not property then
+        Debug("Properties returned", json.encode(PropertiesTable, {indent = true}))
+        return
+    end
+
+    property.playersInGarden[tostring(src)] = true
+end)
+
+RegisterNetEvent('pmanager:server:enterProperty', function (property_id, spawn)
+    local src = source
+    Debug("Player is trying to enter property", property_id)
+
+    local property = Property.Get(property_id)
+    if not property then
+        Debug("Properties returned", json.encode(PropertiesTable, {indent = true}))
+        return
+    end
+
+    local citizenid = GetCitizenid(src)
+
+    if property:CheckForAccess(citizenid) then
+        Debug("Player has access to property")
+        if spawn == 'spawn' then
+            TriggerClientEvent("pmanager:client:enterProperty", src, property_id, spawn)
+        else
+            property:PlayerEnter(src)
+        end
+        Debug("Player entered property")
+        return
+    end
+
+    local ringDoorbellConfirmation = lib.callback.await('pmanager:cb:ringDoorbell', src)
+    if ringDoorbellConfirmation == "confirm" then
+        property:AddToDoorbellPoolTemp(src)
+        Debug("Ringing doorbell")
+        return
+    end
+end)
+
+
+RegisterNetEvent("pmanager:server:removeAccess", function(property_id, citizenidToRemove)
+    local src = source
+
+    local citizenid = GetCitizenid(src)
     local property = Property.Get(property_id)
     if not property then return end
 
-    property:UpdateApartment(data)
-
-    local citizenid = GetCitizenid(targetSrc, realtorSrc)
-    local targetToAdd = QBCore.Functions.GetPlayerByCitizenId(citizenid)
-    local targetPlayer = targetToAdd.PlayerData
-
-    Framework[Config.Notify].Notify(targetSrc, "Your apartment is now at "..apartment, "success")
-    Framework[Config.Notify].Notify(realtorSrc, "You have added ".. targetPlayer.charinfo.firstname .. " " .. targetPlayer.charinfo.lastname .. " to apartment "..apartment, "success")
-end)
-
-exports('IsOwner', function(src, property_id)
-    local property = Property.Get(property_id)
-    if not property then return false end
-
-    local citizenid = GetCitizenid(src, src)
-    return property:CheckForAccess(citizenid)
-end)
-
-function GetCitizenid(targetSrc, callerSrc)
-    local Player = QBCore.Functions.GetPlayer(tonumber(targetSrc))
-    if not Player then
-        Framework[Config.Notify].Notify(callerSrc, "Player not found.", "error")
+    if not property.propertyData.owner == citizenid then
+        -- hacker ban or something
+        Framework[Config.Notify].Notify(src, "You are not the owner of this property!", "error")
         return
     end
-    local PlayerData = Player.PlayerData
-    local citizenid = PlayerData.citizenid
-    return citizenid
-end
 
-function GetCharName(src)
-    local Player = QBCore.Functions.GetPlayer(tonumber(src))
-    if not Player then return end
-    local PlayerData = Player.PlayerData
-    return PlayerData.charinfo.firstname .. " " .. PlayerData.charinfo.lastname
-end
+    local has_access = property.propertyData.has_access
 
-function GetPlayerData(src)
-    local Player = QBCore.Functions.GetPlayer(tonumber(src))
-    if not Player then return end
-    local PlayerData = Player.PlayerData
-    return PlayerData
-end
+    if property:CheckForAccess(citizenidToRemove) then
+        for i = 1, #has_access do
+            if has_access[i] == citizenidToRemove then
+                table.remove(has_access, i)
+                break
+            end
+        end 
 
-function GetPlayer(src)
-    local Player = QBCore.Functions.GetPlayer(tonumber(src))
-    if not Player then return end
-    return Player
-end
+        property:removeMloDoorsAccess(citizenidToRemove)
+        property:UpdateHas_access(has_access)
+
+        local playerToAdd = QBCore.Functions.GetPlayerByCitizenId(citizenidToRemove) or QBCore.Functions.GetOfflinePlayerByCitizenId(citizenidToRemove)
+        local removePlayerData = playerToAdd.PlayerData
+        local srcToRemove = removePlayerData.source
+
+        Framework[Config.Notify].Notify(src, "You removed access from " .. removePlayerData.charinfo.firstname .. " " .. removePlayerData.charinfo.lastname, "success")
+
+        if srcToRemove then
+            Framework[Config.Notify].Notify(srcToRemove, "You lost access to " .. (property.propertyData.street or property.propertyData.apartment) .. " " .. property.property_id, "error")
+        end
+    else
+        Framework[Config.Notify].Notify(src, "This person does not have access to this property!", "error")
+    end
+end)
+
+lib.callback.register("pmanager:cb:getPlayersWithAccess", function (source, property_id)
+    local src = source
+    local citizenidSrc = GetCitizenid(src)
+    local property = Property.Get(property_id)
+    
+    if not property then return end
+    if property.propertyData.owner ~= citizenidSrc then return end
+
+    local withAccess = {}
+    local has_access = property.propertyData.has_access
+
+    for i = 1, #has_access do
+        local citizenid = has_access[i]
+        local Player = QBCore.Functions.GetPlayerByCitizenId(citizenid) or QBCore.Functions.GetOfflinePlayerByCitizenId(citizenid)
+        if Player then
+            withAccess[#withAccess + 1] = {
+                citizenid = citizenid,
+                name = Player.PlayerData.charinfo.firstname .. " " .. Player.PlayerData.charinfo.lastname
+            }
+        end
+    end
+
+    return withAccess
+end)
+
+lib.callback.register('pmanager:cb:getPropertyInfo', function (source, property_id)
+    local src = source
+    local property = Property.Get(property_id)
+
+    if not property then return end
+
+    
+    local PlayerData = GetPlayerData(src)
+    local job = PlayerData.job
+    local jobName = job.name
+    local onDuty = job.onduty
+
+    if RealtorJobs[jobName] and not onDuty then return end
+
+    local data = {}
+
+    local ownerPlayer, ownerName
+
+    local ownerCid = property.propertyData.owner
+    if ownerCid then
+        ownerPlayer = QBCore.Functions.GetPlayerByCitizenId(ownerCid) or QBCore.Functions.GetOfflinePlayerByCitizenId(ownerCid)
+        ownerName = ownerPlayer.PlayerData.charinfo.firstname .. " " .. ownerPlayer.PlayerData.charinfo.lastname
+    else
+        ownerName = "No Owner"
+    end
+
+    data.owner = ownerName
+    data.street = property.propertyData.street
+    data.region = property.propertyData.region
+    data.description = property.propertyData.description
+    data.for_sale = property.propertyData.for_sale
+    data.price = property.propertyData.price
+    data.shell = property.propertyData.shell
+    data.property_id = property.property_id
+
+    return data
+end)
+
+RegisterNetEvent('pmanager:server:resetMetaData', function()
+    local src = source
+    local Player = QBCore.Functions.GetPlayer(src)
+    local insideMeta = Player.PlayerData.metadata["inside"]
+
+    insideMeta.property_id = nil
+    Player.Functions.SetMetaData("inside", insideMeta)
+end)
